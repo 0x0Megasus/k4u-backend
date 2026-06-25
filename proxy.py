@@ -1,0 +1,172 @@
+import re
+import requests
+from fastapi import APIRouter, Query, Response
+from fastapi.responses import StreamingResponse
+from urllib.parse import urljoin
+
+from stream_token_store import stream_tokens
+
+router = APIRouter(prefix="/api/proxy", tags=["Proxy"])
+
+CHUNK_SIZE = 1024 * 1024  # 1MB
+
+
+def _make_headers(user_agent: str | None = None, referer: str | None = None,
+                  extra: dict | None = None) -> dict:
+    """Build request headers for upstream CDN requests."""
+    headers = {
+        "User-Agent": user_agent or (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/139.0.0.0 Safari/537.36"
+        ),
+        "Referer": referer or "https://x.com/",
+    }
+    if extra:
+        headers.update(extra)
+    return headers
+
+
+def _rewrite_playlist(text: str, base_url: str, proxy_base: str) -> str:
+    """Rewrite segment URLs inside an HLS playlist to go through our proxy."""
+
+    def _replace(match):
+        url = match.group(1)
+        # Make absolute if relative
+        if not url.startswith(("http://", "https://")):
+            url = urljoin(base_url.rstrip("/") + "/", url)
+        return proxy_base + requests.utils.quote(url, safe="")
+
+    # Lines that are NOT comments/directives (i.e., they are URLs)
+    pattern = re.compile(r"^(https?://\S+)$", re.MULTILINE)
+    return pattern.sub(_replace, text)
+
+
+def _fetch_and_proxy(url: str, headers: dict) -> Response:
+    """Fetch an upstream URL and return a proxied Response (playlist or stream)."""
+    try:
+        upstream = requests.get(url, headers=headers, stream=True, timeout=30)
+    except requests.RequestException as e:
+        return Response(
+            content=f'{{"error":"upstream request failed: {str(e)}"}}',
+            status_code=502,
+            media_type="application/json",
+            headers={"Access-Control-Allow-Origin": "*"},
+        )
+
+    content_type = upstream.headers.get("Content-Type", "")
+    is_playlist = ".m3u8" in url.lower() or "mpegurl" in content_type or "m3u8" in content_type
+
+    if is_playlist:
+        text = upstream.text
+
+        # Detect HTML-in-disguise
+        stripped = text.strip()
+        if stripped.startswith("<!DOCTYPE") or stripped.startswith("<html") or stripped.startswith("<!"):
+            return Response(
+                content='{"error":"upstream returned HTML instead of HLS playlist"}',
+                status_code=502,
+                media_type="application/json",
+                headers={"Access-Control-Allow-Origin": "*"},
+            )
+
+        # Build the proxy base URL for rewriting segments
+        # Use the URL-based proxy for segments (they change dynamically anyway)
+        proxy_base = "/api/proxy/hls?url="
+        base_url = url[: url.rfind("/") + 1] if "/" in url else url
+
+        rewritten = _rewrite_playlist(text, base_url, proxy_base)
+
+        return Response(
+            content=rewritten,
+            media_type=content_type or "application/vnd.apple.mpegurl",
+            headers={
+                "Access-Control-Allow-Origin": "*",
+                "Access-Control-Allow-Methods": "GET, OPTIONS",
+                "Access-Control-Allow-Headers": "*",
+                "Cache-Control": "no-cache",
+            },
+        )
+    else:
+        return StreamingResponse(
+            upstream.iter_content(chunk_size=CHUNK_SIZE),
+            media_type=content_type or "application/octet-stream",
+            status_code=upstream.status_code,
+            headers={
+                "Access-Control-Allow-Origin": "*",
+                "Access-Control-Allow-Methods": "GET, OPTIONS",
+                "Access-Control-Allow-Headers": "*",
+                "Cache-Control": "no-cache",
+            },
+        )
+
+
+# ── Token-based endpoint (secure) ──────────────────────────────────
+
+@router.get("/stream/{token}")
+async def proxy_stream_token(token: str):
+    """Proxy an HLS stream by token — the upstream URL stays server-side.
+
+    The token is a short-lived random string created by routes.py when the
+    frontend requests event/channel stream sources. The token maps to the
+    real CDN URL + required headers server-side.
+    """
+    info = stream_tokens.get(token)
+    if info is None:
+        return Response(
+            content='{"error":"invalid or expired stream token"}',
+            status_code=404,
+            media_type="application/json",
+            headers={"Access-Control-Allow-Origin": "*"},
+        )
+
+    headers = _make_headers(
+        user_agent=info.user_agent,
+        referer=info.referer,
+        extra=info.headers,
+    )
+    return _fetch_and_proxy(info.url, headers)
+
+
+@router.options("/stream/{token}")
+async def proxy_stream_token_options(token: str):
+    """Handle CORS preflight for token-based proxy."""
+    return Response(
+        content="",
+        media_type="text/plain",
+        headers={
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "GET, OPTIONS",
+            "Access-Control-Allow-Headers": "*",
+            "Access-Control-Max-Age": "86400",
+        },
+    )
+
+
+# ── URL-based endpoint (legacy/fallback) ───────────────────────────
+
+@router.get("/hls")
+async def proxy_hls(url: str = Query(...)):
+    """Proxy HLS playlists and segments by URL (used for segment rewriting).
+
+    This is primarily used for individual segment files that were rewritten
+    in playlists. The token-based endpoint (/stream/{token}) is the secure
+    entry point for initial stream sources.
+    """
+    headers = _make_headers()
+    return _fetch_and_proxy(url, headers)
+
+
+@router.options("/hls")
+async def proxy_hls_options():
+    """Handle CORS preflight."""
+    return Response(
+        content="",
+        media_type="text/plain",
+        headers={
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "GET, OPTIONS",
+            "Access-Control-Allow-Headers": "*",
+            "Access-Control-Max-Age": "86400",
+        },
+    )
