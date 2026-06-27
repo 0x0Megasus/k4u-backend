@@ -11,6 +11,23 @@ router = APIRouter(prefix="/api/proxy", tags=["Proxy"])
 CHUNK_SIZE = 1024 * 1024  # 1MB
 
 
+def _sanitize_header(value: str) -> str:
+    """Strip characters that can't be encoded as latin-1 (HTTP header requirement).
+
+    The upstream API sometimes returns header values containing non-latin-1
+    characters (e.g. \u3164) which cause UnicodeEncodeError in urllib3.
+    """
+    if not value:
+        return value
+    return value.encode("latin-1", errors="replace").decode("latin-1")
+
+
+def _sanitize_headers(headers: dict) -> dict:
+    """Apply latin-1 sanitization to all header values."""
+    return {k: _sanitize_header(v) if isinstance(v, str) else v
+            for k, v in headers.items()}
+
+
 def _make_headers(user_agent: str | None = None, referer: str | None = None,
                   extra: dict | None = None) -> dict:
     """Build request headers for upstream CDN requests."""
@@ -24,7 +41,7 @@ def _make_headers(user_agent: str | None = None, referer: str | None = None,
     }
     if extra:
         headers.update(extra)
-    return headers
+    return _sanitize_headers(headers)
 
 
 def _rewrite_playlist(text: str, base_url: str, proxy_base: str) -> str:
