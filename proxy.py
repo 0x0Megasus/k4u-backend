@@ -74,18 +74,18 @@ def _fetch_and_proxy(url: str, headers: dict) -> Response:
     content_type = upstream.headers.get("Content-Type", "")
     is_playlist = ".m3u8" in url.lower() or "mpegurl" in content_type or "m3u8" in content_type
 
+    # If upstream returned HTML instead of a stream, abort
+    content_is_html = "text/html" in content_type
+    if content_is_html:
+        return Response(
+            content='{"error":"upstream returned HTML instead of HLS playlist"}',
+            status_code=502,
+            media_type="application/json",
+            headers={"Access-Control-Allow-Origin": "*"},
+        )
+
     if is_playlist:
         text = upstream.text
-
-        # Detect HTML-in-disguise
-        stripped = text.strip()
-        if stripped.startswith("<!DOCTYPE") or stripped.startswith("<html") or stripped.startswith("<!"):
-            return Response(
-                content='{"error":"upstream returned HTML instead of HLS playlist"}',
-                status_code=502,
-                media_type="application/json",
-                headers={"Access-Control-Allow-Origin": "*"},
-            )
 
         # Build the proxy base URL for rewriting segments
         # Use the URL-based proxy for segments (they change dynamically anyway)
