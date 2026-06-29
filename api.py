@@ -5,8 +5,17 @@ import json
 
 class YacineTV:
 
-  api_url = "http://ver3.yacinelive.com"
+  api_url = "https://ver3.yacinelive.com"
   key = "c!xZj+N9&G@Ev@vw"
+
+  _HEADERS = {
+    "User-Agent": (
+      "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+      "AppleWebKit/537.36 (KHTML, like Gecko) "
+      "Chrome/139.0.0.0 Safari/537.36"
+    ),
+    "Referer": "https://x.com/",
+  }
 
   def __init__(self):
     pass
@@ -19,7 +28,7 @@ class YacineTV:
     return result
 
   def req(self, path):
-    r = requests.get(self.api_url + path)
+    r = requests.get(self.api_url + path, headers=self._HEADERS, timeout=15)
     timestamp = str(int(time.time()))
     if "t" in r.headers:
       timestamp = r.headers["t"]
@@ -28,6 +37,16 @@ class YacineTV:
       return json.loads(self.decrypt(r.text, key=self.key + timestamp))
 
     except Exception:
+      # Log the upstream response snippet for debugging
+      snippet = (r.text[:300] if r.text else "empty") + (
+        "…" if r.text and len(r.text) > 300 else ""
+      )
+      print(
+        f"[YacineTV] req({path}) failed — "
+        f"HTTP {r.status_code}, "
+        f"Content-Type: {r.headers.get('Content-Type', '?')}, "
+        f"snippet: {snippet}"
+      )
       return {
         "success": False,
         "error": "can't parse json."
