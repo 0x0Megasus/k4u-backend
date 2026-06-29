@@ -5,7 +5,7 @@ import json
 
 class YacineTV:
 
-  api_url = "https://ver3.yacinelive.com"
+  api_url = "http://ver3.yacinelive.com"
   key = "c!xZj+N9&G@Ev@vw"
 
   _HEADERS = {
