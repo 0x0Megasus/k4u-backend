@@ -1,3 +1,4 @@
+import socket
 import requests
 import base64
 import time
@@ -5,8 +6,13 @@ import json
 
 class YacineTV:
 
-  api_url = "http://ver3.yacinelive.com"
+  _HOST = "ver3.yacinelive.com"
   key = "c!xZj+N9&G@Ev@vw"
+
+  # Cloudflare IPs for ver3.yacinelive.com — system DNS on Railway
+  # sometimes resolves to the origin nginx directly (404). Hardcoding
+  # Cloudflare IPs ensures we always go through the CDN.
+  _CF_IPS = ["172.67.203.73", "104.21.37.24"]
 
   _HEADERS = {
     "User-Agent": (
@@ -18,7 +24,36 @@ class YacineTV:
   }
 
   def __init__(self):
-    pass
+    # Resolve the hostname via system DNS as a first guess
+    try:
+      self._ip = socket.getaddrinfo(self._HOST, 80, socket.AF_INET)[0][4][0]
+    except Exception:
+      self._ip = self._CF_IPS[0]
+    # Verify the IP works; fall back to known Cloudflare IPs
+    self._ip = self._resolve_working_ip()
+
+  def _resolve_working_ip(self):
+    """Try system-DNS IP first, then known Cloudflare IPs, return the first that works."""
+    candidates = [self._CF_IPS[0], self._CF_IPS[1]]
+    if self._ip not in candidates:
+      candidates.insert(0, self._ip)
+    tried = set()
+    for ip in candidates:
+      if ip in tried:
+        continue
+      tried.add(ip)
+      try:
+        r = requests.get(
+          f"http://{ip}/api/events",
+          headers={**self._HEADERS, "Host": self._HOST},
+          timeout=5,
+        )
+        if r.status_code == 200 and "T" in r.headers:
+          return ip
+      except Exception:
+        continue
+    # All failed — return the first CF IP anyway, better than nothing
+    return self._CF_IPS[0]
 
   def decrypt(self, enc, key=key):
     enc = base64.b64decode(enc.encode("ascii")).decode("ascii")
@@ -28,7 +63,8 @@ class YacineTV:
     return result
 
   def req(self, path):
-    r = requests.get(self.api_url + path, headers=self._HEADERS, timeout=15)
+    headers = {**self._HEADERS, "Host": self._HOST}
+    r = requests.get(f"http://{self._ip}{path}", headers=headers, timeout=15)
     timestamp = str(int(time.time()))
     if "t" in r.headers:
       timestamp = r.headers["t"]
