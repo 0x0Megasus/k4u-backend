@@ -1,5 +1,6 @@
 import socket
-import requests
+import ssl
+import http.client
 import base64
 import time
 import json
@@ -9,9 +10,11 @@ class YacineTV:
   _HOST = "ver3.yacinelive.com"
   key = "c!xZj+N9&G@Ev@vw"
 
-  # Cloudflare IPs for ver3.yacinelive.com — system DNS on Railway
-  # sometimes resolves to the origin nginx directly (404). Hardcoding
-  # Cloudflare IPs ensures we always go through the CDN.
+  # Cloudflare IPs for ver3.yacinelive.com — Railway's network can't reach the
+  # upstream through Cloudflare via regular HTTP (transparent proxy or DNS
+  # bypasses Cloudflare, hitting the nginx origin directly which returns 404).
+  # By connecting via HTTPS with SNI set to the real hostname, we bypass any
+  # transparent HTTP proxy AND ensure Cloudflare terminates the TLS.
   _CF_IPS = ["172.67.203.73", "104.21.37.24"]
 
   _HEADERS = {
@@ -24,36 +27,37 @@ class YacineTV:
   }
 
   def __init__(self):
-    # Resolve the hostname via system DNS as a first guess
-    try:
-      self._ip = socket.getaddrinfo(self._HOST, 80, socket.AF_INET)[0][4][0]
-    except Exception:
-      self._ip = self._CF_IPS[0]
-    # Verify the IP works; fall back to known Cloudflare IPs
-    self._ip = self._resolve_working_ip()
+    # Build a custom SSL context: connect to the CF IP but send SNI for _HOST.
+    # This lets Cloudflare terminate TLS correctly.
+    self._ctx = ssl.create_default_context()
+    self._ctx.check_hostname = False
+    self._ctx.verify_mode = ssl.CERT_NONE
 
-  def _resolve_working_ip(self):
-    """Try system-DNS IP first, then known Cloudflare IPs, return the first that works."""
-    candidates = [self._CF_IPS[0], self._CF_IPS[1]]
-    if self._ip not in candidates:
-      candidates.insert(0, self._ip)
-    tried = set()
-    for ip in candidates:
-      if ip in tried:
-        continue
-      tried.add(ip)
+    # Pick the first responsive CF IP
+    self._ip = self._resolve_cf_ip()
+
+  def _resolve_cf_ip(self):
+    """Probe known Cloudflare IPs, return the first that serves the API."""
+    for ip in self._CF_IPS:
       try:
-        r = requests.get(
-          f"http://{ip}/api/events",
-          headers={**self._HEADERS, "Host": self._HOST},
-          timeout=5,
-        )
-        if r.status_code == 200 and "T" in r.headers:
+        resp, body = self._do_request(ip, "/api/events", timeout=5)
+        if resp.status == 200 and resp.getheader("T"):
           return ip
       except Exception:
         continue
-    # All failed — return the first CF IP anyway, better than nothing
+    # Fallback to the first IP
     return self._CF_IPS[0]
+
+  def _do_request(self, ip, path, timeout=15):
+    """Make an HTTPS request to *ip* with SNI for _HOST, returning (response, body_text)."""
+    raw = socket.create_connection((ip, 443), timeout=timeout)
+    ssl_sock = self._ctx.wrap_socket(raw, server_hostname=self._HOST)
+    conn = http.client.HTTPSConnection(self._HOST, context=self._ctx)
+    conn.sock = ssl_sock
+    conn.request("GET", path, headers={**self._HEADERS, "Host": self._HOST})
+    resp = conn.getresponse()
+    body = resp.read().decode("utf-8", errors="replace")
+    return resp, body
 
   def decrypt(self, enc, key=key):
     enc = base64.b64decode(enc.encode("ascii")).decode("ascii")
@@ -63,24 +67,22 @@ class YacineTV:
     return result
 
   def req(self, path):
-    headers = {**self._HEADERS, "Host": self._HOST}
-    r = requests.get(f"http://{self._ip}{path}", headers=headers, timeout=15)
+    resp, body = self._do_request(self._ip, path, timeout=15)
     timestamp = str(int(time.time()))
-    if "t" in r.headers:
-      timestamp = r.headers["t"]
+    if resp.getheader("t"):
+      timestamp = resp.getheader("t")
 
     try:
-      return json.loads(self.decrypt(r.text, key=self.key + timestamp))
+      return json.loads(self.decrypt(body, key=self.key + timestamp))
 
     except Exception:
-      # Log the upstream response snippet for debugging
-      snippet = (r.text[:300] if r.text else "empty") + (
-        "…" if r.text and len(r.text) > 300 else ""
+      snippet = (body[:300] if body else "empty") + (
+        "…" if body and len(body) > 300 else ""
       )
       print(
         f"[YacineTV] req({path}) failed — "
-        f"HTTP {r.status_code}, "
-        f"Content-Type: {r.headers.get('Content-Type', '?')}, "
+        f"HTTP {resp.status}, "
+        f"Content-Type: {resp.getheader('Content-Type', '?')}, "
         f"snippet: {snippet}"
       )
       return {
