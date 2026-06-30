@@ -44,33 +44,19 @@ def _make_headers(user_agent: str | None = None, referer: str | None = None,
     return _sanitize_headers(headers)
 
 
-def _rewrite_playlist(text: str, base_url: str) -> str:
-    """Resolve segment URLs to absolute HTTPS CDN URLs (no proxy rewrite).
+def _rewrite_playlist(text: str, base_url: str, proxy_base: str) -> str:
+    """Rewrite segment URLs inside an HLS playlist to go through our proxy."""
 
-    Previously every segment URL was rewritten to go through Railway's proxy
-    (/api/proxy/hls?url=...), which added considerable latency — Railway is
-    not a streaming CDN. Now segments are served directly from the upstream
-    CDN, eliminating the proxy bottleneck.
-
-    Relative URLs are resolved to absolute against the playlist base URL.
-    All URLs are forced to HTTPS to avoid Mixed Content errors — the page
-    is served over HTTPS (Vercel/Cloudflare) and browsers block HTTP XHR
-    requests from HTTPS origins.
-    """
-
-    def _resolve(match):
+    def _replace(match):
         url = match.group(1)
         # Make absolute if relative
         if not url.startswith(("http://", "https://")):
             url = urljoin(base_url.rstrip("/") + "/", url)
-        # Force HTTPS — upstream CDN URLs are often HTTP
-        if url.startswith("http://"):
-            url = "https://" + url[7:]
-        return url
+        return proxy_base + requests.utils.quote(url, safe="")
 
     # Lines that are NOT comments/directives (i.e., they are URLs)
     pattern = re.compile(r"^(https?://\S+)$", re.MULTILINE)
-    return pattern.sub(_resolve, text)
+    return pattern.sub(_replace, text)
 
 
 def _fetch_and_proxy(url: str, headers: dict) -> Response:
@@ -101,9 +87,12 @@ def _fetch_and_proxy(url: str, headers: dict) -> Response:
     if is_playlist:
         text = upstream.text
 
+        # Build the proxy base URL for rewriting segments
+        # Use the URL-based proxy for segments (they change dynamically anyway)
+        proxy_base = "/api/proxy/hls?url="
         base_url = url[: url.rfind("/") + 1] if "/" in url else url
 
-        rewritten = _rewrite_playlist(text, base_url)
+        rewritten = _rewrite_playlist(text, base_url, proxy_base)
 
         return Response(
             content=rewritten,
