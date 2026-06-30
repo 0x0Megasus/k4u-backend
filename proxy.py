@@ -10,6 +10,19 @@ router = APIRouter(prefix="/api/proxy", tags=["Proxy"])
 
 CHUNK_SIZE = 1024 * 1024  # 1MB
 
+# Shared session with connection pooling — reuses TCP/TLS connections to
+# the upstream CDN across segment requests, reducing per-segment latency.
+# Without this, every segment creates a new connection (TCP + TLS handshake).
+_http = requests.Session()
+_adapter = requests.adapters.HTTPAdapter(
+    pool_connections=20,   # Keep 20 connections to the CDN
+    pool_maxsize=100,      # Max 100 connections total
+    max_retries=2,         # Retry failed requests twice
+    pool_block=False,      # Don't block when pool is exhausted
+)
+_http.mount("https://", _adapter)
+_http.mount("http://", _adapter)
+
 
 def _sanitize_header(value: str) -> str:
     """Strip characters that can't be encoded as latin-1 (HTTP header requirement).
@@ -62,7 +75,7 @@ def _rewrite_playlist(text: str, base_url: str, proxy_base: str) -> str:
 def _fetch_and_proxy(url: str, headers: dict) -> Response:
     """Fetch an upstream URL and return a proxied Response (playlist or stream)."""
     try:
-        upstream = requests.get(url, headers=headers, stream=True, timeout=30)
+        upstream = _http.get(url, headers=headers, stream=True, timeout=30)
     except requests.RequestException as e:
         return Response(
             content=f'{{"error":"upstream request failed: {str(e)}"}}',
