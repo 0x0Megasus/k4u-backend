@@ -1,5 +1,6 @@
 import re
 import requests
+import urllib3
 from fastapi import APIRouter, Query, Response
 from fastapi.responses import StreamingResponse
 from urllib.parse import urljoin
@@ -10,6 +11,26 @@ router = APIRouter(prefix="/api/proxy", tags=["Proxy"])
 
 CHUNK_SIZE = 1024 * 1024  # 1MB
 
+# Retry strategy for the flaky upstream CDN:
+#   - Retry on 502/503/504 (CDN node saturated or temporarily unreachable)
+#   - Also retry on connection errors (DNS, TCP, TLS failures)
+#   - Exponential backoff: 0.3s → 0.6s → 1.2s → 2.4s → 4.8s (capped at 10s)
+#   - Do not retry on 200, 404, etc. — those are final.
+# Without this, the default urllib3 Retry only covers connection-level errors,
+# so a single 502 from a saturated CDN node immediately fails the whole request
+# even though a retry to a different node would succeed.
+_retry = urllib3.Retry(
+    total=5,                     # Max 5 attempts total (1 original + 4 retries)
+    connect=3,                   # Retry up to 3 times on connection errors
+    read=2,                      # Retry up to 2 times on incomplete reads
+    status=4,                    # Retry up to 4 times on retryable status codes
+    other=1,                     # Retry once on other errors
+    backoff_factor=0.3,          # Sleep 0.3s * (2^(retry_num - 1)) between retries
+    status_forcelist={502, 503, 504},  # Only retry on these HTTP status codes
+    allowed_methods={"GET"},     # Only retry GET requests (safe to repeat)
+    raise_on_status=False,       # Return the last response instead of raising
+)
+
 # Shared session with connection pooling — reuses TCP/TLS connections to
 # the upstream CDN across segment requests, reducing per-segment latency.
 # Without this, every segment creates a new connection (TCP + TLS handshake).
@@ -17,7 +38,7 @@ _http = requests.Session()
 _adapter = requests.adapters.HTTPAdapter(
     pool_connections=20,   # Keep 20 connections to the CDN
     pool_maxsize=100,      # Max 100 connections total
-    max_retries=2,         # Retry failed requests twice
+    max_retries=_retry,    # Custom retry strategy (handles 502/503/504 too)
     pool_block=False,      # Don't block when pool is exhausted
 )
 _http.mount("https://", _adapter)
@@ -79,6 +100,18 @@ def _fetch_and_proxy(url: str, headers: dict) -> Response:
     except requests.RequestException as e:
         return Response(
             content=f'{{"error":"upstream request failed: {str(e)}"}}',
+            status_code=502,
+            media_type="application/json",
+            headers={"Access-Control-Allow-Origin": "*"},
+        )
+
+    # If upstream still returns 5xx after all retries, bail with our JSON error
+    if upstream.status_code in {502, 503, 504}:
+        return Response(
+            content=(
+                '{"error":"upstream CDN temporarily unavailable '
+                f'(HTTP {upstream.status_code})"}'
+            ),
             status_code=502,
             media_type="application/json",
             headers={"Access-Control-Allow-Origin": "*"},
