@@ -12,6 +12,52 @@ router = APIRouter(prefix="/api/proxy", tags=["Proxy"])
 
 CHUNK_SIZE = 1024 * 1024  # 1MB
 
+# ── Cloudflare-backed CDN DNS resolution ────────────────────────────
+#
+# The YacineTV API returns HLS stream URLs using CDN domains that are
+# behind Cloudflare's private network: *.ycn-redirect.com and *.metava.online.
+# These domains do NOT exist in public DNS — they're only accessible by
+# connecting to a Cloudflare edge IP with the correct Host/SNI header.
+#
+# The mobile app resolves them natively because Cloudflare's public edge
+# servers handle the routing. Our Railway backend, however, uses standard
+# system DNS which returns NXDOMAIN for these domains, causing ALL proxy
+# requests to fail with socket.gaierror → HTTP 502.
+#
+# The fix: monkey-patch socket.getaddrinfo to fall back to Cloudflare edge
+# IPs when standard DNS resolution fails for a known Cloudflare-backed
+# domain pattern. This is the same technique used in api.py (YacineTV class)
+# to reach ver3.yacinelive.com through Cloudflare.
+#
+_CF_IPS = ["172.67.203.73", "104.21.37.24"]
+"""Cloudflare edge IPs known to route traffic for YacineTV CDN / API domains."""
+
+_CLOUDFLARE_SUFFIXES = {".ycn-redirect.com", ".metava.online"}
+"""Domain suffixes that are only reachable through Cloudflare's edge network."""
+
+_original_getaddrinfo = socket.getaddrinfo
+
+
+def _resolve_via_cf(host: str, port: int) -> list[tuple]:
+    """Return Cloudflare IP address tuples for a given host+port."""
+    return [
+        (socket.AF_INET, socket.SOCK_STREAM, 6, "", (ip, port))
+        for ip in _CF_IPS
+    ]
+
+
+def _patched_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
+    """socket.getaddrinfo fallback — try standard DNS first, then Cloudflare edge."""
+    try:
+        return _original_getaddrinfo(host, port, family, type, proto, flags)
+    except socket.gaierror:
+        if any(host.endswith(sfx) for sfx in _CLOUDFLARE_SUFFIXES):
+            return _resolve_via_cf(host, port or 80)
+        raise
+
+
+socket.getaddrinfo = _patched_getaddrinfo
+
 # Retry strategy for the flaky upstream CDN:
 #   - Retry on 502/503/504 (CDN node saturated or temporarily unreachable)
 #   - Also retry on connection errors (DNS, TCP, TLS failures)
@@ -297,3 +343,9 @@ async def proxy_debug(token: str):
         "extra": info.headers,
     }
     return diag
+
+
+@router.get("/debug-url")
+async def proxy_debug_url(url: str = Query(...)):
+    """Test-fetch an arbitrary URL from Railway's network and return diagnostics."""
+    return _verbose_fetch(url, _make_headers())
