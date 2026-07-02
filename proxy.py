@@ -107,11 +107,9 @@ def _fetch_and_proxy(url: str, headers: dict) -> Response:
 
     # If upstream still returns 5xx after all retries, bail with our JSON error
     if upstream.status_code in {502, 503, 504}:
+        msg = 'upstream CDN temporarily unavailable (HTTP %d)' % upstream.status_code
         return Response(
-            content=(
-                '{"error":"upstream CDN temporarily unavailable '
-                f'(HTTP {upstream.status_code})"}'
-            ),
+            content='{"error":"%s"}' % msg,
             status_code=502,
             media_type="application/json",
             headers={"Access-Control-Allow-Origin": "*"},
