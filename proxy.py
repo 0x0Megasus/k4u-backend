@@ -1,9 +1,10 @@
 import re
+import socket
 import requests
 import urllib3
 from fastapi import APIRouter, Query, Response
 from fastapi.responses import StreamingResponse
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse
 
 from stream_token_store import stream_tokens
 
@@ -76,6 +77,45 @@ def _make_headers(user_agent: str | None = None, referer: str | None = None,
     if extra:
         headers.update(extra)
     return _sanitize_headers(headers)
+
+
+def _verbose_fetch(url: str, headers: dict) -> dict:
+    """Diagnostic fetch — returns connection details instead of stream data."""
+    parsed = urlparse(url)
+    host = parsed.hostname or "?"
+    result = {
+        "url": url,
+        "scheme": parsed.scheme,
+        "host": host,
+        "resolved_ips": [],
+        "connect_ok": False,
+        "upstream_status": None,
+        "error": None,
+    }
+    # DNS resolution via built-in socket
+    try:
+        addrs = socket.getaddrinfo(host, 0, socket.AF_INET)
+        result["resolved_ips"] = list(dict.fromkeys(a[4][0] for a in addrs))
+    except Exception as e:
+        result["error"] = f"DNS failed: {e}"
+        return result
+    # TCP connect to first resolved IP
+    try:
+        sock = socket.create_connection((result["resolved_ips"][0], 443), timeout=5)
+        sock.close()
+        result["connect_ok"] = True
+    except Exception as e:
+        result["error"] = f"TCP connect failed: {e}"
+    # HTTP request
+    try:
+        r = requests.get(url, headers=headers, timeout=10, allow_redirects=True)
+        result["upstream_status"] = r.status_code
+        result["content_type"] = r.headers.get("Content-Type", "")
+        result["response_headers"] = {k: v for k, v in r.headers.items()}
+        result["body_preview"] = r.text[:300]
+    except requests.RequestException as e:
+        result["error"] = f"HTTP request failed: {type(e).__name__}: {e}"
+    return result
 
 
 def _rewrite_playlist(text: str, base_url: str, proxy_base: str) -> str:
@@ -231,3 +271,29 @@ async def proxy_hls_options():
             "Access-Control-Max-Age": "86400",
         },
     )
+
+
+# ── Diagnostics ────────────────────────────────────────────────────
+
+@router.get("/debug/{token}")
+async def proxy_debug(token: str):
+    """Return diagnostic info about a stream token — the upstream URL,
+    DNS resolution, TCP connectivity, and a test HTTP request result.
+    NEVER expose this in production without restricting access."""
+    info = stream_tokens.get(token)
+    if info is None:
+        return {"error": "invalid or expired token", "token": token}
+    diag = _verbose_fetch(info.url, _make_headers(
+        user_agent=info.user_agent,
+        referer=info.referer,
+        extra=info.headers,
+    ))
+    diag["token_created"] = info.created_at
+    diag["token_ttl"] = 7200
+    diag["token_remaining"] = max(0, 7200 - (__import__("time").time() - info.created_at))
+    diag["request_headers"] = {
+        "user_agent": info.user_agent,
+        "referer": info.referer,
+        "extra": info.headers,
+    }
+    return diag
