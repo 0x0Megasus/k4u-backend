@@ -60,11 +60,11 @@ class YacineTV:
     return resp, body
 
   def decrypt(self, enc, key=key):
-    enc = base64.b64decode(enc.encode("ascii")).decode("ascii")
-    result = ""
-    for i in range(len(enc)):
-      result = result + chr(ord(enc[i]) ^ ord(key[i % len(key)]))
-    return result
+    enc_bytes = base64.b64decode(enc.encode("ascii"))
+    result = bytearray()
+    for i in range(len(enc_bytes)):
+      result.append(enc_bytes[i] ^ ord(key[i % len(key)]))
+    return result.decode("utf-8")
 
   def req(self, path):
     resp, body = self._do_request(self._ip, path, timeout=15)

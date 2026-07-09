@@ -1,7 +1,9 @@
 import re
 import socket
+import time
 import requests
 import urllib3
+from collections import OrderedDict
 from fastapi import APIRouter, Query, Response
 from fastapi.responses import StreamingResponse
 from urllib.parse import urljoin, urlparse
@@ -11,6 +13,46 @@ from stream_token_store import stream_tokens
 router = APIRouter(prefix="/api/proxy", tags=["Proxy"])
 
 CHUNK_SIZE = 1024 * 1024  # 1MB
+
+# ── Segment cache ──────────────────────────────────────────────────
+#
+# HLS segments (TS / M4S chunks) are immutable and can be cached to
+# reduce CDN round-trips when:
+#   - Multiple viewers watch the same stream (same segments)
+#   - A viewer seeks back a few seconds
+#   - Network issues cause retries
+#
+# Playlists (M3U8) are NOT cached because they change every ~6-10s
+# as new segments become available.
+
+_SEGMENT_CACHE_TTL = 30  # seconds — safe for live HLS (segments are 2-10s)
+
+
+class _SegmentCache:
+    """TTL-based LRU cache for proxied HLS segments."""
+
+    def __init__(self, ttl: int, maxsize: int = 300):
+        self._ttl = ttl
+        self._maxsize = maxsize
+        self._store: OrderedDict[str, tuple[float, bytes, str, int]] = OrderedDict()
+
+    def get(self, url: str):
+        if url not in self._store:
+            return None
+        stored_at, data, media_type, status = self._store[url]
+        if time.time() - stored_at < self._ttl:
+            self._store.move_to_end(url)
+            return data, media_type, status
+        del self._store[url]
+        return None
+
+    def set(self, url: str, data: bytes, media_type: str, status: int):
+        while len(self._store) >= self._maxsize:
+            self._store.popitem(last=False)
+        self._store[url] = (time.time(), data, media_type, status)
+
+
+_segment_cache = _SegmentCache(ttl=_SEGMENT_CACHE_TTL)
 
 # ── Cloudflare-backed CDN DNS resolution ────────────────────────────
 #
@@ -174,51 +216,127 @@ def _rewrite_playlist(text: str, base_url: str, proxy_base: str) -> str:
             url = urljoin(base_url.rstrip("/") + "/", url)
         return proxy_base + requests.utils.quote(url, safe="")
 
-    # Lines that are NOT comments/directives (i.e., they are URLs)
-    pattern = re.compile(r"^(https?://\S+)$", re.MULTILINE)
+    # Lines that are NOT comments/directives (i.e., they are URLs).
+    # This matches any non-empty, non-# line — covering both absolute
+    # HTTP(S) URLs AND relative/absolute paths like /path/segment.ts.
+    # The old pattern (r"^(https?://\S+)$") missed relative paths that
+    # are common in HLS playlists, causing segments to fail silently.
+    pattern = re.compile(r"^(?!#)(\S+)$", re.MULTILINE)
     return pattern.sub(_replace, text)
 
 
-def _fetch_and_proxy(url: str, headers: dict) -> Response:
-    """Fetch an upstream URL and return a proxied Response (playlist or stream)."""
-    try:
-        upstream = _http.get(url, headers=headers, stream=True, timeout=30)
-    except requests.RequestException as e:
-        return Response(
-            content=f'{{"error":"upstream request failed: {str(e)}"}}',
-            status_code=502,
-            media_type="application/json",
-            headers={"Access-Control-Allow-Origin": "*"},
-        )
+def _fetch_from_cdn(url: str, headers: dict, timeout: int = 30):
+    """Fetch from CDN with retries and Cloudflare IP fallback logic.
 
-    # If upstream still returns 5xx after all retries, bail with our JSON error
-    if upstream.status_code in {502, 503, 504}:
-        msg = 'upstream CDN temporarily unavailable (HTTP %d)' % upstream.status_code
+    Returns (response_or_none, error_str).
+    """
+    for attempt, ip in enumerate(_CF_IPS):
+        if attempt > 0:
+            # On subsequent attempts, resolve the domain to a different CF IP
+            # by temporarily overriding the DNS resolution for this domain.
+            # This helps when one CF edge node is saturated.
+            _override_cf_ip = ip
+
+            def _cf_patched_gai(host, port, family=0, type=0, proto=0, flags=0):
+                if any(host.endswith(sfx) for sfx in _CLOUDFLARE_SUFFIXES):
+                    return [
+                        (socket.AF_INET, socket.SOCK_STREAM, 6, "", (_override_cf_ip, port or 443))
+                    ]
+                return _original_getaddrinfo(host, port, family, type, proto, flags)
+
+            socket.getaddrinfo = _cf_patched_gai
+        else:
+            socket.getaddrinfo = _patched_getaddrinfo
+
+        try:
+            resp = _http.get(url, headers=headers, stream=True, timeout=timeout)
+            if resp.status_code not in {502, 503, 504}:
+                return resp, None
+            resp.close()
+        except requests.RequestException as e:
+            if attempt < len(_CF_IPS) - 1:
+                continue  # Try next CF IP
+            return None, str(e)
+
+    # All CF IPs exhausted
+    return None, "all Cloudflare IPs failed"
+
+
+def _fetch_and_proxy(url: str, headers: dict) -> Response:
+    """Fetch an upstream URL and return a proxied Response (playlist or stream).
+
+    Uses an in-memory cache for TS/M4S segments to avoid redundant CDN
+    round-trips. Playlists (M3U8) are NOT cached — they change every ~6-10s.
+    """
+    ctype_hint = ""
+    is_playlist = ".m3u8" in url.lower()
+    is_segment = any(url.lower().endswith(ext) for ext in
+                     (".ts", ".m4s", ".aac", ".mp3", ".ac3", ".ec3", ".vtt", ".js"))
+
+    # ── Cache lookup (segments only) ────────────────────────────────
+    if is_segment:
+        cached = _segment_cache.get(url)
+        if cached is not None:
+            data, media_type, status = cached
+            return Response(
+                content=data,
+                media_type=media_type or "video/MP2T",
+                status_code=status,
+                headers={
+                    "Access-Control-Allow-Origin": "*",
+                    "Access-Control-Allow-Methods": "GET, OPTIONS",
+                    "Access-Control-Allow-Headers": "*",
+                    "Cache-Control": "public, max-age=30",
+                },
+            )
+
+    # ── Fetch from CDN ──────────────────────────────────────────────
+    upstream, error = _fetch_from_cdn(url, headers)
+
+    if error or upstream is None:
         return Response(
-            content='{"error":"%s"}' % msg,
+            content=f'{{"error":"upstream CDN fetch failed: {error or "unknown"}"}}',
             status_code=502,
             media_type="application/json",
             headers={"Access-Control-Allow-Origin": "*"},
         )
 
     content_type = upstream.headers.get("Content-Type", "")
-    is_playlist = ".m3u8" in url.lower() or "mpegurl" in content_type or "m3u8" in content_type
+    if not is_playlist:
+        is_playlist = "mpegurl" in content_type or "m3u8" in content_type
 
-    # If upstream returned HTML instead of a stream, abort
-    content_is_html = "text/html" in content_type
-    if content_is_html:
+    # If upstream returned HTML instead of media, abort.
+    # For playlists this means a broken stream URL.
+    # For segments this means the CDN returned a 404/error page (expired stream).
+    # Pass through the real status code so HLS.js fails fast instead of retrying.
+    if "text/html" in content_type:
+        status = upstream.status_code
+        upstream.close()
+        if is_playlist:
+            return Response(
+                content='{"error":"upstream returned HTML instead of HLS playlist"}',
+                status_code=502,
+                media_type="application/json",
+                headers={"Access-Control-Allow-Origin": "*"},
+            )
+        # Segment → return the actual CDN status (404 etc.) with an empty body
+        # so HLS.js doesn't stall on retries.
         return Response(
-            content='{"error":"upstream returned HTML instead of HLS playlist"}',
-            status_code=502,
-            media_type="application/json",
-            headers={"Access-Control-Allow-Origin": "*"},
+            content=b"",
+            status_code=status if status >= 400 else 502,
+            media_type="video/MP2T",
+            headers={
+                "Access-Control-Allow-Origin": "*",
+                "Access-Control-Allow-Methods": "GET, OPTIONS",
+                "Access-Control-Allow-Headers": "*",
+                "Cache-Control": "no-cache",
+            },
         )
 
     if is_playlist:
         text = upstream.text
 
         # Build the proxy base URL for rewriting segments
-        # Use the URL-based proxy for segments (they change dynamically anyway)
         proxy_base = "/api/proxy/hls?url="
         base_url = url[: url.rfind("/") + 1] if "/" in url else url
 
@@ -235,15 +353,32 @@ def _fetch_and_proxy(url: str, headers: dict) -> Response:
             },
         )
     else:
-        return StreamingResponse(
-            upstream.iter_content(chunk_size=CHUNK_SIZE),
-            media_type=content_type or "application/octet-stream",
-            status_code=upstream.status_code,
+        # ── Segment fetch: read into cache and return ───────────────
+        try:
+            chunk = upstream.content  # read full content from the streamed response
+        except requests.RequestException as e:
+            return Response(
+                content=f'{{"error":"failed reading segment: {str(e)}"}}',
+                status_code=502,
+                media_type="application/json",
+                headers={"Access-Control-Allow-Origin": "*"},
+            )
+
+        media_type = content_type or "video/MP2T"
+        status_code = upstream.status_code
+
+        if is_segment:
+            _segment_cache.set(url, chunk, media_type, status_code)
+
+        return Response(
+            content=chunk,
+            media_type=media_type,
+            status_code=status_code,
             headers={
                 "Access-Control-Allow-Origin": "*",
                 "Access-Control-Allow-Methods": "GET, OPTIONS",
                 "Access-Control-Allow-Headers": "*",
-                "Cache-Control": "no-cache",
+                "Cache-Control": "public, max-age=30",
             },
         )
 
@@ -251,7 +386,7 @@ def _fetch_and_proxy(url: str, headers: dict) -> Response:
 # ── Token-based endpoint (secure) ──────────────────────────────────
 
 @router.get("/stream/{token}")
-async def proxy_stream_token(token: str):
+def proxy_stream_token(token: str):
     """Proxy an HLS stream by token — the upstream URL stays server-side.
 
     The token is a short-lived random string created by routes.py when the
@@ -276,7 +411,7 @@ async def proxy_stream_token(token: str):
 
 
 @router.options("/stream/{token}")
-async def proxy_stream_token_options(token: str):
+def proxy_stream_token_options(token: str):
     """Handle CORS preflight for token-based proxy."""
     return Response(
         content="",
@@ -293,7 +428,7 @@ async def proxy_stream_token_options(token: str):
 # ── URL-based endpoint (legacy/fallback) ───────────────────────────
 
 @router.get("/hls")
-async def proxy_hls(url: str = Query(...)):
+def proxy_hls(url: str = Query(...)):
     """Proxy HLS playlists and segments by URL (used for segment rewriting).
 
     This is primarily used for individual segment files that were rewritten
@@ -305,7 +440,7 @@ async def proxy_hls(url: str = Query(...)):
 
 
 @router.options("/hls")
-async def proxy_hls_options():
+def proxy_hls_options():
     """Handle CORS preflight."""
     return Response(
         content="",
@@ -322,7 +457,7 @@ async def proxy_hls_options():
 # ── Diagnostics ────────────────────────────────────────────────────
 
 @router.get("/debug/{token}")
-async def proxy_debug(token: str):
+def proxy_debug(token: str):
     """Return diagnostic info about a stream token — the upstream URL,
     DNS resolution, TCP connectivity, and a test HTTP request result.
     NEVER expose this in production without restricting access."""
@@ -336,7 +471,7 @@ async def proxy_debug(token: str):
     ))
     diag["token_created"] = info.created_at
     diag["token_ttl"] = 7200
-    diag["token_remaining"] = max(0, 7200 - (__import__("time").time() - info.created_at))
+    diag["token_remaining"] = max(0, 7200 - (time.time() - info.created_at))
     diag["request_headers"] = {
         "user_agent": info.user_agent,
         "referer": info.referer,
@@ -346,6 +481,6 @@ async def proxy_debug(token: str):
 
 
 @router.get("/debug-url")
-async def proxy_debug_url(url: str = Query(...)):
+def proxy_debug_url(url: str = Query(...)):
     """Test-fetch an arbitrary URL from Railway's network and return diagnostics."""
     return _verbose_fetch(url, _make_headers())
