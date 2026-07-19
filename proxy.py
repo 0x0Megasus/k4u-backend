@@ -294,6 +294,7 @@ def _fetch_and_proxy(url: str, headers: dict) -> Response:
     upstream, error = _fetch_from_cdn(url, headers)
 
     if error or upstream is None:
+        print(f"[PROXY] CDN fetch failed — url={url} error={error or 'unknown'}")
         return Response(
             content=f'{{"error":"upstream CDN fetch failed: {error or "unknown"}"}}',
             status_code=502,
@@ -305,12 +306,18 @@ def _fetch_and_proxy(url: str, headers: dict) -> Response:
     if not is_playlist:
         is_playlist = "mpegurl" in content_type or "m3u8" in content_type
 
+    # Log non-200 upstream responses for diagnosis
+    if upstream.status_code != 200:
+        print(f"[PROXY] Upstream non-200 — url={url} status={upstream.status_code} content_type={content_type}")
+
     # If upstream returned HTML instead of media, abort.
     # For playlists this means a broken stream URL.
     # For segments this means the CDN returned a 404/error page (expired stream).
     # Pass through the real status code so HLS.js fails fast instead of retrying.
     if "text/html" in content_type:
         status = upstream.status_code
+        preview = upstream.text[:200] if hasattr(upstream, 'text') else ''
+        print(f"[PROXY] HTML response — url={url} status={status} preview={preview}")
         upstream.close()
         if is_playlist:
             return Response(
@@ -357,6 +364,7 @@ def _fetch_and_proxy(url: str, headers: dict) -> Response:
         try:
             chunk = upstream.content  # read full content from the streamed response
         except requests.RequestException as e:
+            print(f"[PROXY] Segment read failed — url={url} error={e}")
             return Response(
                 content=f'{{"error":"failed reading segment: {str(e)}"}}',
                 status_code=502,
@@ -395,6 +403,7 @@ def proxy_stream_token(token: str):
     """
     info = stream_tokens.get(token)
     if info is None:
+        print(f"[PROXY] Invalid/expired token — token={token[:12]}...")
         return Response(
             content='{"error":"invalid or expired stream token"}',
             status_code=404,

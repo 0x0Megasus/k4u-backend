@@ -1,5 +1,6 @@
 import re
 import requests
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from fastapi import APIRouter
 from api import YacineTV
 from stream_token_store import stream_tokens
@@ -110,55 +111,125 @@ def _sanitize_header_value(value: str | None) -> str | None:
     return value.encode("latin-1", errors="replace").decode("latin-1")
 
 
+_VALIDATE_TIMEOUT = 5  # seconds — quick HEAD to check if URL is alive
+
+
+def _validate_source(src: dict) -> dict | None:
+    """Check if a stream source URL is reachable.
+
+    Does a quick HEAD request with a short timeout. Returns the source dict
+    if valid, or None if the URL is dead (timeout, 4xx, 5xx).
+    """
+    url = src.get("url")
+    if not url:
+        return src  # No URL — pass through (shouldn't happen)
+
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/139.0.0.0 Safari/537.36"
+        ),
+    }
+    ua = _sanitize_header_value(src.get("user_agent"))
+    ref = _sanitize_header_value(src.get("referer"))
+    if ua:
+        headers["User-Agent"] = ua
+    if ref:
+        headers["Referer"] = ref
+    if src.get("headers") and isinstance(src.get("headers"), dict):
+        headers.update(src["headers"])
+
+    try:
+        # HEAD first — fast, no body downloaded
+        r = requests.head(url, headers=headers, timeout=_VALIDATE_TIMEOUT,
+                          allow_redirects=True)
+        if r.status_code < 400:
+            return src
+        # HEAD failed — try GET (some CDN nodes reject HEAD)
+        r = requests.get(url, headers=headers, timeout=_VALIDATE_TIMEOUT,
+                         stream=True)
+        r.close()
+        if r.status_code < 400:
+            return src
+        print(f"[ROUTES] Source dead — url={url} status={r.status_code}")
+        return None
+    except requests.RequestException as e:
+        print(f"[ROUTES] Source unreachable — url={url} error={e}")
+        return None
+
+
 def _tokenize_sources(data: list) -> list:
     """Replace raw URLs with short-lived tokens so the frontend never sees upstream CDN URLs.
 
-    Before tokenizing, attempts to resolve HTML redirector pages (used by some
-    MBC channels) to the actual M3U8 stream URL.
+    1. Resolve HTML redirector pages to direct M3U8 URLs
+    2. Validate all URLs in parallel (HEAD/GET with short timeout)
+    3. Create tokens only for sources that are reachable
     """
-    tokenized = []
+    # Step 1: Resolve redirectors (sequential — usually fast)
+    resolved_sources = []
     for src in data:
         if not isinstance(src, dict):
-            tokenized.append(src)
+            resolved_sources.append(src)
             continue
         url = src.get("url")
-        if url:
-            # Resolve HTML redirector pages to direct M3U8 URLs
-            if _is_redirector_url(url):
-                resolved = _resolve_redirector(
-                    url,
-                    user_agent=src.get("user_agent"),
-                    referer=src.get("referer"),
-                    headers=src.get("headers"),
-                )
-                if resolved != url:
-                    # Successfully resolved to a real M3U8 URL
-                    # Discard the redirector's garbage headers — use defaults
-                    url = resolved
-                    ua = None
-                    ref = None
-                    extra_headers = None
-                else:
-                    ua = _sanitize_header_value(src.get("user_agent"))
-                    ref = _sanitize_header_value(src.get("referer"))
-                    extra_headers = src.get("headers")
-            else:
-                ua = _sanitize_header_value(src.get("user_agent"))
-                ref = _sanitize_header_value(src.get("referer"))
-                extra_headers = src.get("headers")
+        if not url:
+            resolved_sources.append(src)
+            continue
 
-            token = stream_tokens.create_token(
-                url=url,
-                user_agent=ua,
-                referer=ref,
-                headers=extra_headers,
+        if _is_redirector_url(url):
+            new_url = _resolve_redirector(
+                url,
+                user_agent=src.get("user_agent"),
+                referer=src.get("referer"),
+                headers=src.get("headers"),
             )
-            tokenized.append({
-                "name": src.get("name"),
-                "token": token,
-            })
-        else:
-            tokenized.append(src)
+            if new_url != url:
+                src = {**src, "url": new_url,
+                       "user_agent": None, "referer": None, "headers": None}
+
+        resolved_sources.append(src)
+
+    # Step 2: Validate all URLs in parallel
+    valid_sources = []
+    with ThreadPoolExecutor(max_workers=min(len(resolved_sources), 5)) as pool:
+        futures = {
+            pool.submit(_validate_source, src): src
+            for src in resolved_sources
+            if isinstance(src, dict) and src.get("url")
+        }
+        for future in as_completed(futures):
+            result = future.result()
+            if result is not None:
+                valid_sources.append(result)
+
+    # Re-add non-dict entries (shouldn't happen but be safe)
+    for src in resolved_sources:
+        if not isinstance(src, dict):
+            valid_sources.append(src)
+
+    # Step3: Tokenize only valid sources
+    tokenized = []
+    for src in valid_sources:
+        if not isinstance(src, dict) or not src.get("url"):
+            continue
+        ua = _sanitize_header_value(src.get("user_agent"))
+        ref = _sanitize_header_value(src.get("referer"))
+        extra_headers = src.get("headers")
+        token = stream_tokens.create_token(
+            url=src["url"],
+            user_agent=ua,
+            referer=ref,
+            headers=extra_headers,
+        )
+        tokenized.append({
+            "name": src.get("name"),
+            "token": token,
+        })
+
+    skipped = len(data) - len(tokenized)
+    if skipped > 0:
+        print(f"[ROUTES] Pre-validation skipped {skipped}/{len(data)} dead sources")
     return tokenized
 
 
